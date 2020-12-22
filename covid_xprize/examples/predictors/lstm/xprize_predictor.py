@@ -15,11 +15,9 @@ from keras.constraints import Constraint
 from keras.layers import Dense
 from keras.layers import Input
 from keras.layers import LSTM
-from keras.layers import Dropout
 from keras.layers import Lambda
 from keras.models import Model
-import tensorflow as tf
-
+from keras.layers import Dropout
 
 # See https://github.com/OxCGRT/covid-policy-tracker
 DATA_URL = "https://raw.githubusercontent.com/OxCGRT/covid-policy-tracker/master/data/OxCGRT_latest.csv"
@@ -56,9 +54,13 @@ NB_LOOKBACK_DAYS = 21
 NB_TEST_DAYS = 14
 WINDOW_SIZE = 7
 US_PREFIX = "United States / "
-NUM_TRIALS = 1
+NUM_TRIALS = 5
 LSTM_SIZE = 32
-MAX_NB_COUNTRIES = 30
+MAX_NB_COUNTRIES = 20
+DROPOUT_RATE = 0.4
+
+
+# LAST_DAY_DATA = '2020-12-10'
 
 
 class Positive(Constraint):
@@ -79,8 +81,6 @@ class XPrizePredictor(object):
     """
 
     def __init__(self, path_to_model_weights, data_url):
-        physical_devices = tf.config.list_physical_devices('GPU')
-        tf.config.experimental.set_memory_growth(physical_devices[0], enable=True)
         if path_to_model_weights:
 
             # Load model weights
@@ -90,6 +90,7 @@ class XPrizePredictor(object):
                                                       nb_action=nb_action,
                                                       lstm_size=LSTM_SIZE,
                                                       nb_lookback_days=NB_LOOKBACK_DAYS)
+            print(f"Loading {path_to_model_weights} model")
             self.predictor.load_weights(path_to_model_weights)
 
             # Make sure data is available to make predictions
@@ -131,7 +132,10 @@ class XPrizePredictor(object):
                 geo_start_date = min(last_known_date + np.timedelta64(1, 'D'), start_date)
                 npis_gdf = npis_df[(npis_df.Date >= geo_start_date) & (npis_df.Date <= end_date)]
 
-                pred_new_cases = self._get_new_cases_preds(cdf, g, npis_gdf)
+                pred_new_cases = self._get_new_cases_preds(cdf, g, npis_gdf,
+                                                           last_known_date
+                                                           if start_date > last_known_date + np.timedelta64(1, 'D')
+                                                           else start_date - np.timedelta64(1, 'D'))
 
             # Append forecast data to results to return
             country = npis_df[npis_df.GeoID == g].iloc[0].CountryName
@@ -147,10 +151,18 @@ class XPrizePredictor(object):
         # Return only the requested predictions
         return forecast_df[(forecast_df.Date >= start_date) & (forecast_df.Date <= end_date)]
 
-    def _get_new_cases_preds(self, c_df, g, npis_df):
+    def _get_new_cases_preds(self, c_df, g, npis_df, geo_start_date):
         cdf = c_df[c_df.ConfirmedCases.notnull()]
-        initial_context_input = self.country_samples[g]['X_test_context'][-1]
-        initial_action_input = self.country_samples[g]['X_test_action'][-1]
+        # TODO: figure out if starting from idx is a good idea or if we should use -1
+        # Fetch the input from either last known day of data or day before start date (whichever one is smallest)
+        try:
+            idx = list(self.country_samples[g]['date']).index(geo_start_date)
+            initial_context_input = self.country_samples[g]['X_context'][idx]
+            initial_action_input = self.country_samples[g]['X_action'][idx]
+        except ValueError:
+            initial_context_input = self.country_samples[g]['X_test_context'][-1]
+            initial_action_input = self.country_samples[g]['X_test_action'][-1]
+
         # Predictions with passed npis
         cnpis_df = npis_df[npis_df.GeoID == g]
         npis_sequence = np.array(cnpis_df[NPI_COLUMNS])
@@ -225,6 +237,7 @@ class XPrizePredictor(object):
 
         # Create column of value to predict
         df['PredictionRatio'] = df['CaseRatio'] / (1 - df['ProportionInfected'])
+        df['DeathPredictionRatio'] = df['DeathRatio'] / (1 - df['ProportionInfected'])
 
         return df
 
@@ -241,6 +254,7 @@ class XPrizePredictor(object):
         latest_df["GeoID"] = np.where(latest_df["RegionName"].isnull(),
                                       latest_df["CountryName"],
                                       latest_df["CountryName"] + ' / ' + latest_df["RegionName"])
+        # latest_df = latest_df[(latest_df['Date'] <= LAST_DAY_DATA)]
         return latest_df
 
     @staticmethod
@@ -300,6 +314,7 @@ class XPrizePredictor(object):
         :return: a dictionary of train and test sets, for each specified country
         """
         context_column = 'PredictionRatio'
+        date_column = 'Date'
         action_columns = NPI_COLUMNS
         outcome_column = 'PredictionRatio'
         country_samples = {}
@@ -309,28 +324,35 @@ class XPrizePredictor(object):
             context_data = np.array(cdf[context_column])
             action_data = np.array(cdf[action_columns])
             outcome_data = np.array(cdf[outcome_column])
+            date_data = np.array(cdf[date_column])
             context_samples = []
             action_samples = []
             outcome_samples = []
+            date_samples = []
             nb_total_days = outcome_data.shape[0]
             for d in range(NB_LOOKBACK_DAYS, nb_total_days):
                 context_samples.append(context_data[d - NB_LOOKBACK_DAYS:d])
                 action_samples.append(action_data[d - NB_LOOKBACK_DAYS:d])
                 outcome_samples.append(outcome_data[d])
+                date_samples.append(date_data[d])
             if len(outcome_samples) > 0:
                 X_context = np.expand_dims(np.stack(context_samples, axis=0), axis=2)
                 X_action = np.stack(action_samples, axis=0)
                 y = np.stack(outcome_samples, axis=0)
+                date = np.stack(date_samples, axis=0)
                 country_samples[g] = {
                     'X_context': X_context,
                     'X_action': X_action,
                     'y': y,
+                    'date': date,
                     'X_train_context': X_context[:-NB_TEST_DAYS],
                     'X_train_action': X_action[:-NB_TEST_DAYS],
                     'y_train': y[:-NB_TEST_DAYS],
+                    'date_train': date[:-NB_TEST_DAYS],
                     'X_test_context': X_context[-NB_TEST_DAYS:],
                     'X_test_action': X_action[-NB_TEST_DAYS:],
                     'y_test': y[-NB_TEST_DAYS:],
+                    'date_test': date[-NB_TEST_DAYS:],
                 }
         return country_samples
 
@@ -413,11 +435,11 @@ class XPrizePredictor(object):
         y = np.clip(y, MIN_VALUE, MAX_VALUE)
 
         # Aggregate data for testing only on top countries
-        test_all_X_context_list = [country_samples[g]['X_train_context']
+        test_all_X_context_list = [country_samples[g]['X_test_context']
                                    for g in geos]
-        test_all_X_action_list = [country_samples[g]['X_train_action']
+        test_all_X_action_list = [country_samples[g]['X_test_action']
                                   for g in geos]
-        test_all_y_list = [country_samples[g]['y_train']
+        test_all_y_list = [country_samples[g]['y_test']
                            for g in geos]
         test_X_context = np.concatenate(test_all_X_context_list)
         test_X_action = np.concatenate(test_all_X_action_list)
@@ -439,7 +461,7 @@ class XPrizePredictor(object):
                                                           nb_action=X_action.shape[-1],
                                                           lstm_size=LSTM_SIZE,
                                                           nb_lookback_days=NB_LOOKBACK_DAYS)
-            history = self._train_model(training_model, X_context, X_action, y, epochs=2500, verbose=0)
+            history = self._train_model(training_model, X_context, X_action, y, epochs=1000, verbose=0)
             top_epoch = np.argmin(history.history['val_loss'])
             train_loss = history.history['loss'][top_epoch]
             val_loss = history.history['val_loss'][top_epoch]
@@ -484,18 +506,21 @@ class XPrizePredictor(object):
     @staticmethod
     def _most_affected_geos(df, nb_geos, min_historical_days):
         """
-        Returns the list of most affected countries, in terms of the prediction ratio.
+        Returns the list of most affected countries, in terms of confirmed deaths.
         :param df: the data frame containing the historical data
         :param nb_geos: the number of geos to return
         :param min_historical_days: the minimum days of historical data the countries must have
         :return: a list of country names of size nb_countries if there were enough, and otherwise a list of all the
         country names that have at least min_look_back_days data points.
         """
+        # TODO: Try sorting countries/regions differently for training
         # By default use most affected geos with enough history
-        gdf = df.groupby('GeoID')['PredictionRatio'].agg(['max', 'count']).sort_values(by='max', ascending=False)
+
+        # PredictionRatio to decide which countries
+        gdf = df.groupby('GeoID')['DeathPredictionRatio'].agg(['max', 'count']).sort_values(by='max', ascending=False)
         filtered_gdf = gdf[gdf["count"] > min_historical_days]
-        geos = list(filtered_gdf.head(int(nb_geos * 0.8)).index) + list(filtered_gdf.tail(int(nb_geos * 0.2)).index)
-        return list(set(geos))
+        geos = list(filtered_gdf.head(nb_geos).index)
+        return geos
 
     # Shuffling data prior to train/val split
     def _permute_data(self, X_context, X_action, y, seed=301):
@@ -512,27 +537,33 @@ class XPrizePredictor(object):
         # Create context encoder
         context_input = Input(shape=(nb_lookback_days, nb_context),
                               name='context_input')
+        # TODO: Try to set different parameters (LSTM layer in Keras)
         x = LSTM(lstm_size, name='context_lstm')(context_input)
-        dropout = Dropout(0.2)(x)
+
+        # TODO: Dropout?
+        x = Dropout(DROPOUT_RATE)(x)
         context_output = Dense(units=1,
                                activation='softplus',
-                               name='context_dense')(dropout)
+                               name='context_dense')(x)
 
         # Create action encoder
         # Every aspect is monotonic and nonnegative except final bias
         action_input = Input(shape=(nb_lookback_days, nb_action),
                              name='action_input')
+        # TODO: Try to set different parameters (LSTM layer in Keras)
         x = LSTM(units=lstm_size,
                  kernel_constraint=Positive(),
                  recurrent_constraint=Positive(),
                  bias_constraint=Positive(),
                  return_sequences=False,
                  name='action_lstm')(action_input)
-        dropout_action = Dropout(0.2)(x)
+        # TODO: Dropout?
+        x = Dropout(DROPOUT_RATE)(x)
+
         action_output = Dense(units=1,
                               activation='sigmoid',
                               kernel_constraint=Positive(),
-                              name='action_dense')(dropout_action)
+                              name='action_dense')(x)
 
         # Create prediction model
         model_output = Lambda(_combine_r_and_d, name='prediction')(
@@ -615,3 +646,11 @@ class XPrizePredictor(object):
             country_cases[g] = pred_new_cases
 
         return country_indep, country_preds, country_cases
+
+
+if __name__ == '__main__':
+    predictor = XPrizePredictor(None, DATA_FILE_PATH)
+    model = predictor.train()
+    print("Saving model")
+    # NUM_TRIALS, LSTM_SIZE, LOOKBACK_DAYS, TOP_COUNTRIES, Dropout Rate
+    model.save_weights("models/lstm_5_32_21_20_0.4.h5")
